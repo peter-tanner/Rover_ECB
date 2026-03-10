@@ -57,6 +57,22 @@ void Error_Handler(void);
 /* USER CODE END EFP */
 
 /* Private defines -----------------------------------------------------------*/
+#define Ia_val_Pin GPIO_PIN_0
+#define Ia_val_GPIO_Port GPIOC
+#define latch_reset_Pin GPIO_PIN_1
+#define latch_reset_GPIO_Port GPIOA
+#define latch_output_Pin GPIO_PIN_2
+#define latch_output_GPIO_Port GPIOA
+#define trip_thresh_Pin GPIO_PIN_4
+#define trip_thresh_GPIO_Port GPIOA
+#define arm_pin_Pin GPIO_PIN_2
+#define arm_pin_GPIO_Port GPIOB
+#define fault_led_Pin GPIO_PIN_15
+#define fault_led_GPIO_Port GPIOB
+#define can_led_Pin GPIO_PIN_9
+#define can_led_GPIO_Port GPIOA
+#define can_mode_Pin GPIO_PIN_10
+#define can_mode_GPIO_Port GPIOA
 
 /* USER CODE BEGIN Private defines */
 

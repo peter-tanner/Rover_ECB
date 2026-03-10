@@ -60,8 +60,8 @@ all: main-build
 main-build: Rover\ ECB.elf secondary-outputs
 
 # Tool invocations
-Rover\ ECB.elf Rover\ ECB.map: $(OBJS) $(USER_OBJS) C:\Users\Armaan\ Chawla\Documents\Rover_ECB\STM32F103RCTX_FLASH.ld makefile objects.list $(OPTIONAL_TOOL_DEPS)
-	arm-none-eabi-gcc -o "Rover ECB.elf" @"objects.list" $(USER_OBJS) $(LIBS) -mcpu=cortex-m3 -T"C:\Users\Armaan Chawla\Documents\Rover_ECB\STM32F103RCTX_FLASH.ld" --specs=nosys.specs -Wl,-Map="Rover ECB.map" -Wl,--gc-sections -static --specs=nano.specs -mfloat-abi=soft -mthumb -Wl,--start-group -lc -lm -Wl,--end-group
+Rover\ ECB.elf Rover\ ECB.map: $(OBJS) $(USER_OBJS) D:\VSCode\Rover\ ECB\STM32F103RCTX_FLASH.ld makefile objects.list $(OPTIONAL_TOOL_DEPS)
+	arm-none-eabi-gcc -o "Rover ECB.elf" @"objects.list" $(USER_OBJS) $(LIBS) -mcpu=cortex-m3 -T"D:\VSCode\Rover ECB\STM32F103RCTX_FLASH.ld" --specs=nosys.specs -Wl,-Map="Rover ECB.map" -Wl,--gc-sections -static --specs=nano.specs -mfloat-abi=soft -mthumb -Wl,--start-group -lc -lm -Wl,--end-group
 	@echo 'Finished building target: $@'
 	@echo ' '
 

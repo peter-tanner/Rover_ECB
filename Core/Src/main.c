@@ -6,7 +6,7 @@
   ******************************************************************************
   * @attention
   *
-  * Copyright (c) 2025 STMicroelectronics.
+  * Copyright (c) 2026 STMicroelectronics.
   * All rights reserved.
   *
   * This software is licensed under terms that can be found in the LICENSE file
@@ -21,8 +21,7 @@
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
-#include <stdbool.h>
-#include <stdio.h>
+
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -50,25 +49,22 @@ DAC_HandleTypeDef hdac;
 I2C_HandleTypeDef hi2c1;
 
 TIM_HandleTypeDef htim2;
+TIM_HandleTypeDef htim6;
+TIM_HandleTypeDef htim7;
 
 /* USER CODE BEGIN PV */
-bool can_activity = false;
-bool breaker_open = true;
+uint32_t error_blink_interval = 200;
+uint32_t normal_blink_interval = 4000;
+uint32_t last_blink = 0;
 
-volatile float Curr_val = 0.0f;
-volatile float Temp_val = 0.0f;
+bool arm_pressed = false;
+uint32_t arm_pressed_tick = 0;
+
+uint32_t telemetry_send_rate = 500;
 volatile bool system_tripped = false;
 
-// Timing and Button Logic
-volatile bool button_down = false;
-volatile uint32_t button_press_tick = 0;
-uint32_t last_sensor_tick = 0;
-uint32_t last_blink_tick = 0;
+uint32_t dac_val = 2100;
 
-// Hardware Constants
-const float SENSITIVITY_V_PER_A = 0.0165f; // (3.3V / 200A)
-const float V_OFFSET = 1.65f;              // 0A center point
-uint16_t dac_value = 2200;                 // Sets PA4 > 1.653V
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -79,50 +75,16 @@ static void MX_DAC_Init(void);
 static void MX_I2C1_Init(void);
 static void MX_ADC1_Init(void);
 static void MX_TIM2_Init(void);
+static void MX_TIM6_Init(void);
+static void MX_TIM7_Init(void);
 /* USER CODE BEGIN PFP */
-void CAN_Send_Message(uint8_t TxData[8], uint32_t DLC);
+void Reset_Latch(void);
+void Set_Dac(uint32_t val);
+void Generate_Telemetry(void)
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
-void Read_Sensors(void) {
-    // 1. Measure Current (PC0)
-    HAL_ADC_Start(&hadc1);
-    if (HAL_ADC_PollForConversion(&hadc1, 10) == HAL_OK) {
-        uint32_t raw_adc = HAL_ADC_GetValue(&hadc1);
-        float voltage = (raw_adc * 3.3f) / 4095.0f;
-        Curr_val = (voltage - V_OFFSET) / SENSITIVITY_V_PER_A; //
-    }
-    HAL_ADC_Stop(&hadc1);
-
-    // 2. Measure TMP112 Temperature (I2C)
-    uint8_t i2c_buf[2];
-    if (HAL_I2C_Master_Receive(&hi2c1, (0x48 << 1), i2c_buf, 2, 50) == HAL_OK) {
-        int16_t raw_temp = (i2c_buf[0] << 4) | (i2c_buf[1] >> 4);
-        Temp_val = raw_temp * 0.0625f; //
-    }
-}
-
-void CAN_Send_Message(uint8_t TxData[8], uint32_t DLC){
-    HAL_GPIO_WritePin(GPIOA, GPIO_PIN_9, GPIO_PIN_RESET);
-	CAN_TxHeaderTypeDef   TxHeader;
-	uint32_t              TxMailbox;
-
-	TxHeader.IDE = CAN_ID_STD;
-
-	TxHeader.StdId = 0x446;
-	TxHeader.RTR = CAN_RTR_DATA;
-	TxHeader.DLC = DLC;
-	if (HAL_CAN_AddTxMessage(&hcan, &TxHeader, TxData, &TxMailbox) != HAL_OK)
-	{
-	   Error_Handler ();
-	}
-	HAL_Delay(10);
-    HAL_GPIO_WritePin(GPIOA, GPIO_PIN_9, GPIO_PIN_SET);
-}
-
-
-
 
 /* USER CODE END 0 */
 
@@ -160,24 +122,15 @@ int main(void)
   MX_I2C1_Init();
   MX_ADC1_Init();
   MX_TIM2_Init();
+  MX_TIM6_Init();
+  MX_TIM7_Init();
   /* USER CODE BEGIN 2 */
-  // Variable to ramp up the DAC voltage
-  HAL_DAC_Start(&hdac, DAC_CHANNEL_1);
-  HAL_DAC_SetValue(&hdac, DAC_CHANNEL_1, DAC_ALIGN_12B_R, dac_value);
+  HAL_DAC_Start(&hdac, DAC_CHANNEL_1);  // Start the DAC
+  Set_Dac(dac_val);
 
-  if (HAL_CAN_Start(&hcan) != HAL_OK) {
-        Error_Handler();
-    }
-
-  HAL_GPIO_WritePin(GPIOB, GPIO_PIN_15, GPIO_PIN_SET);
-  HAL_GPIO_WritePin(GPIOA, GPIO_PIN_1, GPIO_PIN_RESET);
-  HAL_GPIO_WritePin(GPIOA, GPIO_PIN_9, GPIO_PIN_SET);
-
-  uint8_t TxData[8];
-  TxData[0] = 50;
-  TxData[1] = 0xAA;
-
-  HAL_ADC_Start_IT(&hadc1);
+  if(HAL_GPIO_ReadPin (GPIOA, GPIO_PIN_2) == GPIO_PIN_SET){
+	  system_tripped = true;
+  }
 
   /* USER CODE END 2 */
 
@@ -185,6 +138,42 @@ int main(void)
   /* USER CODE BEGIN WHILE */
   while (1)
   {
+
+	  if(system_tripped && (HAL_GetTick() - last_blink >= error_blink_interval)){ //blink fault led rapidly if system is tripped
+		  HAL_GPIO_TogglePin(GPIOB, GPIO_PIN_15);
+		  last_blink = HAL_GetTick();
+	  }
+	  else if(system_tripped == false && (HAL_GetTick() - last_blink >= normal_blink_interval)){ // flash led very briefly if system is not tripped
+		  HAL_GPIO_WritePin(GPIOB, GPIO_PIN_15, GPIO_PIN_RESET); //turn led on
+		  last_blink = HAL_GetTick();
+
+		  HAL_TIM_Base_Stop_IT(&htim6);
+		  __HAL_TIM_SET_AUTORELOAD(&htim6, 50 - 1); // configure timer 6 to trigger interrupt in 50 ms
+		  __HAL_TIM_SET_COUNTER(&htim6, 0);
+		  __HAL_TIM_CLEAR_FLAG(&htim6, TIM_FLAG_UPDATE);
+		  HAL_TIM_Base_Start_IT(&htim6); // start timer
+	  }
+
+	  //check if the arm pin is being pressed
+	  if(HAL_GPIO_ReadPin(GPIOB, GPIO_PIN_2) == GPIO_PIN_SET && arm_pressed == false){
+		  arm_pressed = true;
+		  arm_pressed_tick = HAL_GetTick();
+	  } else if(HAL_GPIO_ReadPin(GPIOB, GPIO_PIN_2) == GPIO_PIN_RESET){
+		  arm_pressed = false;
+	  }
+
+	  if(system_tripped && arm_pressed && (HAL_GetTick() - arm_pressed_tick >= 1500)){ // reset the latch if the system is tripped and the arm pin has been held for longer than 1.5s
+		  system_tripped = false;
+		  Reset_Latch();
+		  for(uint32_t i = 0; i < 5; i++){ //blink led quicklu a few times
+			  HAL_GPIO_TogglePin(GPIOB, GPIO_PIN_15);
+			  HAL_Delay(100);
+		  }
+		  HAL_GPIO_WritePin(GPIOB, GPIO_PIN_15, GPIO_PIN_SET); //turn led off
+	  }
+
+
+
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
@@ -270,7 +259,7 @@ static void MX_ADC1_Init(void)
   */
   sConfig.Channel = ADC_CHANNEL_10;
   sConfig.Rank = ADC_REGULAR_RANK_1;
-  sConfig.SamplingTime = ADC_SAMPLETIME_1CYCLE_5;
+  sConfig.SamplingTime = ADC_SAMPLETIME_239CYCLES_5;
   if (HAL_ADC_ConfigChannel(&hadc1, &sConfig) != HAL_OK)
   {
     Error_Handler();
@@ -290,7 +279,6 @@ static void MX_CAN_Init(void)
 {
 
   /* USER CODE BEGIN CAN_Init 0 */
-   HAL_GPIO_WritePin(GPIOA, GPIO_PIN_10, 0); // enter normal mode
 
   /* USER CODE END CAN_Init 0 */
 
@@ -298,7 +286,7 @@ static void MX_CAN_Init(void)
 
   /* USER CODE END CAN_Init 1 */
   hcan.Instance = CAN1;
-  hcan.Init.Prescaler = 8;
+  hcan.Init.Prescaler = 2;
   hcan.Init.Mode = CAN_MODE_NORMAL;
   hcan.Init.SyncJumpWidth = CAN_SJW_1TQ;
   hcan.Init.TimeSeg1 = CAN_BS1_2TQ;
@@ -439,6 +427,82 @@ static void MX_TIM2_Init(void)
 }
 
 /**
+  * @brief TIM6 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_TIM6_Init(void)
+{
+
+  /* USER CODE BEGIN TIM6_Init 0 */
+
+  /* USER CODE END TIM6_Init 0 */
+
+  TIM_MasterConfigTypeDef sMasterConfig = {0};
+
+  /* USER CODE BEGIN TIM6_Init 1 */
+
+  /* USER CODE END TIM6_Init 1 */
+  htim6.Instance = TIM6;
+  htim6.Init.Prescaler = 7999;
+  htim6.Init.CounterMode = TIM_COUNTERMODE_UP;
+  htim6.Init.Period = 65535;
+  htim6.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
+  if (HAL_TIM_Base_Init(&htim6) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sMasterConfig.MasterOutputTrigger = TIM_TRGO_RESET;
+  sMasterConfig.MasterSlaveMode = TIM_MASTERSLAVEMODE_DISABLE;
+  if (HAL_TIMEx_MasterConfigSynchronization(&htim6, &sMasterConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN TIM6_Init 2 */
+
+  /* USER CODE END TIM6_Init 2 */
+
+}
+
+/**
+  * @brief TIM7 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_TIM7_Init(void)
+{
+
+  /* USER CODE BEGIN TIM7_Init 0 */
+
+  /* USER CODE END TIM7_Init 0 */
+
+  TIM_MasterConfigTypeDef sMasterConfig = {0};
+
+  /* USER CODE BEGIN TIM7_Init 1 */
+
+  /* USER CODE END TIM7_Init 1 */
+  htim7.Instance = TIM7;
+  htim7.Init.Prescaler = 7999;
+  htim7.Init.CounterMode = TIM_COUNTERMODE_UP;
+  htim7.Init.Period = 65535;
+  htim7.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
+  if (HAL_TIM_Base_Init(&htim7) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sMasterConfig.MasterOutputTrigger = TIM_TRGO_RESET;
+  sMasterConfig.MasterSlaveMode = TIM_MASTERSLAVEMODE_DISABLE;
+  if (HAL_TIMEx_MasterConfigSynchronization(&htim7, &sMasterConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN TIM7_Init 2 */
+
+  /* USER CODE END TIM7_Init 2 */
+
+}
+
+/**
   * @brief GPIO Initialization Function
   * @param None
   * @retval None
@@ -457,47 +521,43 @@ static void MX_GPIO_Init(void)
   __HAL_RCC_GPIOB_CLK_ENABLE();
 
   /*Configure GPIO pin Output Level */
-  HAL_GPIO_WritePin(GPIOA, GPIO_PIN_1|GPIO_PIN_9|GPIO_PIN_10, GPIO_PIN_RESET);
+  HAL_GPIO_WritePin(GPIOA, latch_reset_Pin|can_led_Pin|can_mode_Pin, GPIO_PIN_RESET);
 
   /*Configure GPIO pin Output Level */
-  HAL_GPIO_WritePin(GPIOB, GPIO_PIN_15, GPIO_PIN_RESET);
+  HAL_GPIO_WritePin(fault_led_GPIO_Port, fault_led_Pin, GPIO_PIN_RESET);
 
-  /*Configure GPIO pin : PA1 */
-  GPIO_InitStruct.Pin = GPIO_PIN_1;
+  /*Configure GPIO pin : latch_reset_Pin */
+  GPIO_InitStruct.Pin = latch_reset_Pin;
   GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
   GPIO_InitStruct.Pull = GPIO_PULLDOWN;
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
-  HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
+  HAL_GPIO_Init(latch_reset_GPIO_Port, &GPIO_InitStruct);
 
-  /*Configure GPIO pin : PA2 */
-  GPIO_InitStruct.Pin = GPIO_PIN_2;
+  /*Configure GPIO pin : latch_output_Pin */
+  GPIO_InitStruct.Pin = latch_output_Pin;
+  GPIO_InitStruct.Mode = GPIO_MODE_IT_RISING;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  HAL_GPIO_Init(latch_output_GPIO_Port, &GPIO_InitStruct);
+
+  /*Configure GPIO pin : arm_pin_Pin */
+  GPIO_InitStruct.Pin = arm_pin_Pin;
   GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
-  GPIO_InitStruct.Pull = GPIO_PULLDOWN;
-  HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  HAL_GPIO_Init(arm_pin_GPIO_Port, &GPIO_InitStruct);
 
-  /*Configure GPIO pin : PB2 */
-  GPIO_InitStruct.Pin = GPIO_PIN_2;
-  GPIO_InitStruct.Mode = GPIO_MODE_IT_RISING_FALLING;
-  GPIO_InitStruct.Pull = GPIO_PULLDOWN;
-  HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
-
-  /*Configure GPIO pin : PB15 */
-  GPIO_InitStruct.Pin = GPIO_PIN_15;
+  /*Configure GPIO pin : fault_led_Pin */
+  GPIO_InitStruct.Pin = fault_led_Pin;
   GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
-  HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
+  HAL_GPIO_Init(fault_led_GPIO_Port, &GPIO_InitStruct);
 
-  /*Configure GPIO pins : PA9 PA10 */
-  GPIO_InitStruct.Pin = GPIO_PIN_9|GPIO_PIN_10;
+  /*Configure GPIO pins : can_led_Pin can_mode_Pin */
+  GPIO_InitStruct.Pin = can_led_Pin|can_mode_Pin;
   GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
   HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
-
-  /* EXTI interrupt init*/
-  HAL_NVIC_SetPriority(EXTI2_IRQn, 0, 0);
-  HAL_NVIC_EnableIRQ(EXTI2_IRQn);
 
   /* USER CODE BEGIN MX_GPIO_Init_2 */
 
@@ -505,15 +565,60 @@ static void MX_GPIO_Init(void)
 }
 
 /* USER CODE BEGIN 4 */
-void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin) {
-    if (GPIO_Pin == GPIO_PIN_2) { // PB2
-        if (HAL_GPIO_ReadPin(GPIOB, GPIO_PIN_2) == GPIO_PIN_SET) {
-            button_down = true;
-            button_press_tick = HAL_GetTick(); // Record start time
-        } else {
-            button_down = false; // Reset if released early
-        }
+void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
+{
+    if (htim->Instance == TIM6)
+    {
+        //stop the timer so it doesn't repeat
+        HAL_TIM_Base_Stop_IT(&htim6);
+		HAL_GPIO_WritePin(GPIOB, GPIO_PIN_15, GPIO_PIN_SET); // turn off led
+    } else if (htim->Instance == TIM7)
+    {
+        //stop the timer so it doesn't repeat
+        HAL_TIM_Base_Stop_IT(&htim7);
+		HAL_GPIO_WritePin(GPIOA, GPIO_PIN_1, GPIO_PIN_RESET); // turn of reset pin
     }
+}
+
+void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
+{
+    if (GPIO_Pin == GPIO_PIN_2 && system_tripped == false) //if the latch gets tripped
+    {
+        system_tripped = true;
+    }
+
+}
+
+void Reset_Latch(void){
+	//generate a 100ms pulse on the reset pin
+	HAL_GPIO_WritePin(GPIOA, GPIO_PIN_1, GPIO_PIN_SET);
+
+	  HAL_TIM_Base_Stop_IT(&htim7);
+	  __HAL_TIM_SET_AUTORELOAD(&htim7, 100 - 1); // configure timer 6 to trigger interrupt in 100 ms
+	  __HAL_TIM_SET_COUNTER(&htim7, 0);
+	  __HAL_TIM_CLEAR_FLAG(&htim7, TIM_FLAG_UPDATE);
+	  HAL_TIM_Base_Start_IT(&htim7); // start timer
+}
+
+void Set_Dac(uint32_t val){
+	HAL_DAC_SetValue(&hdac, DAC_CHANNEL_1, DAC_ALIGN_12B_R, val);
+}
+
+void Generate_Telemetry(void){
+
+	uint32_t adc_value = 0;
+
+	HAL_ADC_Start(&hadc1);                          // Start conversion
+	HAL_ADC_PollForConversion(&hadc1, HAL_MAX_DELAY); // Wait until done
+	adc_value = HAL_ADC_GetValue(&hadc1);           // Read result (0-4095)
+	HAL_ADC_Stop(&hadc1);
+
+	#define VREF 3.3f
+	#define ADC_TO_VOLTAGE(raw)  ((float)(raw) / 4095.0f * VREF)
+
+	uint32_t raw = HAL_ADC_GetValue(&hadc1);
+	float voltage = ADC_TO_VOLTAGE(raw);
+
 }
 /* USER CODE END 4 */
 
@@ -526,7 +631,9 @@ void Error_Handler(void)
   /* USER CODE BEGIN Error_Handler_Debug */
   /* User can add his own implementation to report the HAL error return state */
   __disable_irq();
-
+  while (1)
+  {
+  }
   /* USER CODE END Error_Handler_Debug */
 }
 #ifdef USE_FULL_ASSERT
