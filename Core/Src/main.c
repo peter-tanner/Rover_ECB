@@ -61,14 +61,6 @@ bool arm_pressed = false;
 uint32_t arm_pressed_tick = 0;
 
 uint32_t telemetry_send_rate = 500;
-volatile bool system_tripped = false;
-
-uint32_t dac_val = 2100;
-
-bool arm_pressed = false;
-uint32_t arm_pressed_tick = 0;
-
-uint32_t telemetry_send_rate = 500;
 uint32_t last_telemetry_tick = 0; // Added for non-blocking CAN
 
 volatile bool system_tripped = false;
@@ -94,7 +86,7 @@ static void MX_TIM7_Init(void);
 /* USER CODE BEGIN PFP */
 void Reset_Latch(void);
 void Set_Dac(uint32_t val);
-void Generate_Telemetry(void)
+void Generate_Telemetry(void);
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
@@ -658,6 +650,7 @@ void Generate_Telemetry(void){
     }
 }
 
+#if 0
 void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
 {
     if (GPIO_Pin == GPIO_PIN_2 && system_tripped == false) //if the latch gets tripped
@@ -681,7 +674,9 @@ void Reset_Latch(void){
 void Set_Dac(uint32_t val){
 	HAL_DAC_SetValue(&hdac, DAC_CHANNEL_1, DAC_ALIGN_12B_R, val);
 }
+#endif
 
+#if 0
 void Generate_Telemetry(void){
 
 	uint32_t adc_value = 0;
@@ -698,6 +693,7 @@ void Generate_Telemetry(void){
 	float voltage = ADC_TO_VOLTAGE(raw);
 
 }
+#endif
 /* USER CODE END 4 */
 
 /**
