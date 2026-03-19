@@ -18,6 +18,8 @@
 /* USER CODE END Header */
 /* Includes ------------------------------------------------------------------*/
 #include "main.h"
+#include "stm32f1xx_hal_can.h"
+#include <stdint.h>
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
@@ -51,8 +53,11 @@ I2C_HandleTypeDef hi2c1;
 TIM_HandleTypeDef htim2;
 TIM_HandleTypeDef htim6;
 TIM_HandleTypeDef htim7;
+TIM_HandleTypeDef htim8;
 
 /* USER CODE BEGIN PV */
+uint8_t initialized = 0;
+
 uint32_t error_blink_interval = 200;
 uint32_t normal_blink_interval = 4000;
 uint32_t last_blink = 0;
@@ -70,7 +75,19 @@ float Temp_val = 0.0f;
 
 uint32_t dac_val = 2100; // Resulting in > 1.653V
 
+TIM_HandleTypeDef *htim_can_disconnect = &htim8;
+uint32_t tx_mailbox;
+struct can_buffer_slot
+{
+  uint16_t message_priority;
+  uint8_t size;
+  uint8_t data[8];
+};
 
+lwrb_t can_tx_rb;
+char can_tx_rb_data[sizeof(struct can_buffer_slot) * 32];
+volatile size_t can_tx_rb_current_len;
+uint8_t sleep_guard = 1;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -83,6 +100,7 @@ static void MX_ADC1_Init(void);
 static void MX_TIM2_Init(void);
 static void MX_TIM6_Init(void);
 static void MX_TIM7_Init(void);
+static void MX_TIM8_Init(void);
 /* USER CODE BEGIN PFP */
 void Reset_Latch(void);
 void Set_Dac(uint32_t val);
@@ -91,6 +109,69 @@ void Generate_Telemetry(void);
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
+uint8_t can_move_to_fifo()
+{
+  uint32_t primask;
+  uint8_t started = 0;
+  struct can_buffer_slot slot;
+
+  primask = __get_PRIMASK();
+  __disable_irq();
+  if (HAL_CAN_GetTxMailboxesFreeLevel(&hcan) > 0 && lwrb_read(&can_tx_rb, &slot, sizeof(slot)) > 0)
+  {
+    HAL_TIM_Base_Start_IT(htim_can_disconnect);
+    __HAL_TIM_SET_COUNTER(htim_can_disconnect, 0);
+
+    HAL_GPIO_WritePin(can_mode_GPIO_Port, can_mode_Pin, GPIO_PIN_RESET);
+    HAL_GPIO_WritePin(can_led_GPIO_Port, can_led_Pin, GPIO_PIN_SET);
+
+    CAN_TxHeaderTypeDef can_classic_tx_header = {
+        .StdId = 0x446,
+        .IDE = CAN_ID_STD,
+        .RTR = CAN_RTR_DATA,
+        .DLC = slot.size};
+
+    uint8_t delay = 0;
+    while (HAL_CAN_AddTxMessage(&hcan, &can_classic_tx_header, slot.data, &tx_mailbox) != HAL_OK)
+    {
+      HAL_Delay(1);
+      delay++;
+    }
+    if (delay > 0)
+    {
+#ifdef UART_DBG
+      char buf[32];
+      snprintf(buf, sizeof(buf), "CAN_OVERFLOW %d\r\n", delay);
+#endif
+    }
+    started = 1;
+    __HAL_TIM_SET_COUNTER(htim_can_disconnect, 0);
+  }
+
+  __set_PRIMASK(primask);
+  return started;
+}
+
+void can_transmit(void *data, uint32_t length, uint16_t id_priority__UNUSED)
+{
+  static struct can_buffer_slot slot_null;
+  struct can_buffer_slot slot = {
+      .size = length,
+      .message_priority = id_priority__UNUSED,
+      .data = {}};
+  uint8_t fail = 9;
+
+  memcpy(slot.data, data, length);
+
+  /* Write data to transmit buffer */
+  while (fail-- && lwrb_write(&can_tx_rb, &slot, sizeof(struct can_buffer_slot)) != sizeof(struct can_buffer_slot))
+  {
+    // char err_str[] = "can buffer overrun 0\r\n";
+    // err_str[sizeof(err_str) - 4] = '0' + fail;
+    lwrb_read(&can_tx_rb, &slot_null, sizeof(slot_null));
+  }
+  can_move_to_fifo();
+}
 
 /* USER CODE END 0 */
 
@@ -102,7 +183,7 @@ int main(void)
 {
 
   /* USER CODE BEGIN 1 */
-
+  lwrb_init(&can_tx_rb, can_tx_rb_data, sizeof(can_tx_rb_data));
   /* USER CODE END 1 */
 
   /* MCU Configuration--------------------------------------------------------*/
@@ -130,13 +211,25 @@ int main(void)
   MX_TIM2_Init();
   MX_TIM6_Init();
   MX_TIM7_Init();
+  MX_TIM8_Init();
   /* USER CODE BEGIN 2 */
-  HAL_DAC_Start(&hdac, DAC_CHANNEL_1);  // Start the DAC
+  HAL_DAC_Start(&hdac, DAC_CHANNEL_1); // Start the DAC
   Set_Dac(dac_val);
 
-  if(HAL_GPIO_ReadPin (GPIOA, GPIO_PIN_2) == GPIO_PIN_SET){
-	  system_tripped = true;
+  // CONFIGURE CAN
+  if (HAL_CAN_ActivateNotification(&hcan, CAN_IT_TX_MAILBOX_EMPTY) != HAL_OK)
+    Error_Handler();
+  if (HAL_CAN_Start(&hcan) != HAL_OK)
+    Error_Handler();
+  HAL_GPIO_WritePin(can_mode_GPIO_Port, can_mode_Pin, GPIO_PIN_SET);
+  // END CONFIGURE CAN
+
+  if (HAL_GPIO_ReadPin(GPIOA, GPIO_PIN_2) == GPIO_PIN_SET)
+  {
+    system_tripped = true;
   }
+
+  initialized = 1;
 
   /* USER CODE END 2 */
 
@@ -145,65 +238,65 @@ int main(void)
   while (1)
   {
 
-	  if(system_tripped && (HAL_GetTick() - last_blink >= error_blink_interval)){ //blink fault led rapidly if system is tripped
-		  HAL_GPIO_TogglePin(GPIOB, GPIO_PIN_15);
-		  last_blink = HAL_GetTick();
-	  }
-	  else if(system_tripped == false && (HAL_GetTick() - last_blink >= normal_blink_interval)){ // flash led very briefly if system is not tripped
-		  HAL_GPIO_WritePin(GPIOB, GPIO_PIN_15, GPIO_PIN_RESET); //turn led on
-		  last_blink = HAL_GetTick();
+    if (system_tripped && (HAL_GetTick() - last_blink >= error_blink_interval))
+    { //blink fault led rapidly if system is tripped
+      HAL_GPIO_TogglePin(GPIOB, GPIO_PIN_15);
+      last_blink = HAL_GetTick();
+    }
+    else if (system_tripped == false && (HAL_GetTick() - last_blink >= normal_blink_interval))
+    {                                                        // flash led very briefly if system is not tripped
+      HAL_GPIO_WritePin(GPIOB, GPIO_PIN_15, GPIO_PIN_RESET); //turn led on
+      last_blink = HAL_GetTick();
 
-		  HAL_TIM_Base_Stop_IT(&htim6);
-		  __HAL_TIM_SET_AUTORELOAD(&htim6, 50 - 1); // configure timer 6 to trigger interrupt in 50 ms
-		  __HAL_TIM_SET_COUNTER(&htim6, 0);
-		  __HAL_TIM_CLEAR_FLAG(&htim6, TIM_FLAG_UPDATE);
-		  HAL_TIM_Base_Start_IT(&htim6); // start timer
-	  }
+      HAL_TIM_Base_Stop_IT(&htim6);
+      __HAL_TIM_SET_AUTORELOAD(&htim6, 50 - 1); // configure timer 6 to trigger interrupt in 50 ms
+      __HAL_TIM_SET_COUNTER(&htim6, 0);
+      __HAL_TIM_CLEAR_FLAG(&htim6, TIM_FLAG_UPDATE);
+      HAL_TIM_Base_Start_IT(&htim6); // start timer
+    }
 
-	  //check if the arm pin is being pressed
-	  if(HAL_GPIO_ReadPin(GPIOB, GPIO_PIN_2) == GPIO_PIN_SET && arm_pressed == false){
-		  arm_pressed = true;
-		  arm_pressed_tick = HAL_GetTick();
-	  } else if(HAL_GPIO_ReadPin(GPIOB, GPIO_PIN_2) == GPIO_PIN_RESET){
-		  arm_pressed = false;
-	  }
+    //check if the arm pin is being pressed
+    if (HAL_GPIO_ReadPin(GPIOB, GPIO_PIN_2) == GPIO_PIN_SET && arm_pressed == false)
+    {
+      arm_pressed = true;
+      arm_pressed_tick = HAL_GetTick();
+    }
+    else if (HAL_GPIO_ReadPin(GPIOB, GPIO_PIN_2) == GPIO_PIN_RESET)
+    {
+      arm_pressed = false;
+    }
 
-	  if(system_tripped && arm_pressed && (HAL_GetTick() - arm_pressed_tick >= 1500)){ // reset the latch if the system is tripped and the arm pin has been held for longer than 1.5s
-		  system_tripped = false;
-		  Reset_Latch();
-		  for(uint32_t i = 0; i < 5; i++){ //blink led quicklu a few times
-			  HAL_GPIO_TogglePin(GPIOB, GPIO_PIN_15);
-			  HAL_Delay(100);
-		  }
-		  HAL_GPIO_WritePin(GPIOB, GPIO_PIN_15, GPIO_PIN_SET); //turn led off
-	  }
+    if (system_tripped && arm_pressed && (HAL_GetTick() - arm_pressed_tick >= 1500))
+    { // reset the latch if the system is tripped and the arm pin has been held for longer than 1.5s
+      system_tripped = false;
+      Reset_Latch();
+      for (uint32_t i = 0; i < 5; i++)
+      { //blink led quicklu a few times
+        HAL_GPIO_TogglePin(GPIOB, GPIO_PIN_15);
+        HAL_Delay(100);
+      }
+      HAL_GPIO_WritePin(GPIOB, GPIO_PIN_15, GPIO_PIN_SET); //turn led off
+    }
 
-	  if (HAL_GetTick() - last_telemetry_tick >= telemetry_send_rate) {
-	          Generate_Telemetry(); // Reads ADC and I2C
+    if (HAL_GetTick() - last_telemetry_tick >= telemetry_send_rate)
+    {
+      Generate_Telemetry(); // Reads ADC and I2C
 
-	          // Prepare CAN Data: [Current, Temp, Trip_Status]
-	          uint8_t can_data[3];
-	          can_data[0] = (uint8_t)(Curr_val + 100); // Offset for negative range
-	          can_data[1] = (uint8_t)Temp_val;
-	          can_data[2] = (uint8_t)system_tripped;
+      // Prepare CAN Data: [Current, Temp, Trip_Status]
+      uint8_t can_data[3];
+      can_data[0] = (uint8_t)(Curr_val + 100); // Offset for negative range
+      can_data[1] = (uint8_t)Temp_val;
+      can_data[2] = (uint8_t)system_tripped;
 
-	          CAN_TxHeaderTypeDef TxHeader = {
-	              .StdId = 0x446,
-	              .IDE = CAN_ID_STD,
-	              .RTR = CAN_RTR_DATA,
-	              .DLC = 3
-	          };
-	          uint32_t TxMailbox;
-	          HAL_CAN_AddTxMessage(&hcan, &TxHeader, can_data, &TxMailbox);
+      can_transmit(can_data, sizeof(can_data), 0);
 
-	          last_telemetry_tick = HAL_GetTick();
-	      }
-	    }
+      last_telemetry_tick = HAL_GetTick();
+    }
+  }
 
+  /* USER CODE END WHILE */
 
-    /* USER CODE END WHILE */
-
-    /* USER CODE BEGIN 3 */
+  /* USER CODE BEGIN 3 */
   /* USER CODE END 3 */
 }
 
@@ -230,8 +323,7 @@ void SystemClock_Config(void)
 
   /** Initializes the CPU, AHB and APB buses clocks
   */
-  RCC_ClkInitStruct.ClockType = RCC_CLOCKTYPE_HCLK|RCC_CLOCKTYPE_SYSCLK
-                              |RCC_CLOCKTYPE_PCLK1|RCC_CLOCKTYPE_PCLK2;
+  RCC_ClkInitStruct.ClockType = RCC_CLOCKTYPE_HCLK | RCC_CLOCKTYPE_SYSCLK | RCC_CLOCKTYPE_PCLK1 | RCC_CLOCKTYPE_PCLK2;
   RCC_ClkInitStruct.SYSCLKSource = RCC_SYSCLKSOURCE_HSE;
   RCC_ClkInitStruct.AHBCLKDivider = RCC_SYSCLK_DIV1;
   RCC_ClkInitStruct.APB1CLKDivider = RCC_HCLK_DIV1;
@@ -293,7 +385,6 @@ static void MX_ADC1_Init(void)
   /* USER CODE BEGIN ADC1_Init 2 */
 
   /* USER CODE END ADC1_Init 2 */
-
 }
 
 /**
@@ -312,7 +403,7 @@ static void MX_CAN_Init(void)
 
   /* USER CODE END CAN_Init 1 */
   hcan.Instance = CAN1;
-  hcan.Init.Prescaler = 2;
+  hcan.Init.Prescaler = 8;
   hcan.Init.Mode = CAN_MODE_NORMAL;
   hcan.Init.SyncJumpWidth = CAN_SJW_1TQ;
   hcan.Init.TimeSeg1 = CAN_BS1_2TQ;
@@ -330,7 +421,6 @@ static void MX_CAN_Init(void)
   /* USER CODE BEGIN CAN_Init 2 */
 
   /* USER CODE END CAN_Init 2 */
-
 }
 
 /**
@@ -370,7 +460,6 @@ static void MX_DAC_Init(void)
   /* USER CODE BEGIN DAC_Init 2 */
 
   /* USER CODE END DAC_Init 2 */
-
 }
 
 /**
@@ -404,7 +493,6 @@ static void MX_I2C1_Init(void)
   /* USER CODE BEGIN I2C1_Init 2 */
 
   /* USER CODE END I2C1_Init 2 */
-
 }
 
 /**
@@ -449,7 +537,6 @@ static void MX_TIM2_Init(void)
   /* USER CODE BEGIN TIM2_Init 2 */
 
   /* USER CODE END TIM2_Init 2 */
-
 }
 
 /**
@@ -487,7 +574,6 @@ static void MX_TIM6_Init(void)
   /* USER CODE BEGIN TIM6_Init 2 */
 
   /* USER CODE END TIM6_Init 2 */
-
 }
 
 /**
@@ -525,7 +611,51 @@ static void MX_TIM7_Init(void)
   /* USER CODE BEGIN TIM7_Init 2 */
 
   /* USER CODE END TIM7_Init 2 */
+}
 
+/**
+  * @brief TIM8 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_TIM8_Init(void)
+{
+
+  /* USER CODE BEGIN TIM8_Init 0 */
+
+  /* USER CODE END TIM8_Init 0 */
+
+  TIM_ClockConfigTypeDef sClockSourceConfig = {0};
+  TIM_MasterConfigTypeDef sMasterConfig = {0};
+
+  /* USER CODE BEGIN TIM8_Init 1 */
+
+  /* USER CODE END TIM8_Init 1 */
+  htim8.Instance = TIM8;
+  htim8.Init.Prescaler = CAN_TIMEOUT_PSC_DIV;
+  htim8.Init.CounterMode = TIM_COUNTERMODE_UP;
+  htim8.Init.Period = CAN_TIMEOUT_ms;
+  htim8.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
+  htim8.Init.RepetitionCounter = 0;
+  htim8.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
+  if (HAL_TIM_Base_Init(&htim8) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sClockSourceConfig.ClockSource = TIM_CLOCKSOURCE_INTERNAL;
+  if (HAL_TIM_ConfigClockSource(&htim8, &sClockSourceConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sMasterConfig.MasterOutputTrigger = TIM_TRGO_RESET;
+  sMasterConfig.MasterSlaveMode = TIM_MASTERSLAVEMODE_DISABLE;
+  if (HAL_TIMEx_MasterConfigSynchronization(&htim8, &sMasterConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN TIM8_Init 2 */
+
+  /* USER CODE END TIM8_Init 2 */
 }
 
 /**
@@ -541,16 +671,30 @@ static void MX_GPIO_Init(void)
   /* USER CODE END MX_GPIO_Init_1 */
 
   /* GPIO Ports Clock Enable */
-  __HAL_RCC_GPIOD_CLK_ENABLE();
   __HAL_RCC_GPIOC_CLK_ENABLE();
+  __HAL_RCC_GPIOD_CLK_ENABLE();
   __HAL_RCC_GPIOA_CLK_ENABLE();
   __HAL_RCC_GPIOB_CLK_ENABLE();
 
   /*Configure GPIO pin Output Level */
-  HAL_GPIO_WritePin(GPIOA, latch_reset_Pin|can_led_Pin|can_mode_Pin, GPIO_PIN_RESET);
+  HAL_GPIO_WritePin(GPIOA, latch_reset_Pin | can_led_Pin | can_mode_Pin, GPIO_PIN_RESET);
 
   /*Configure GPIO pin Output Level */
   HAL_GPIO_WritePin(fault_led_GPIO_Port, fault_led_Pin, GPIO_PIN_RESET);
+
+  /*Configure GPIO pins : PC13 PC14 PC15 PC1
+                           PC2 PC3 PC4 PC5
+                           PC6 PC7 PC8 PC9
+                           PC10 PC11 PC12 */
+  GPIO_InitStruct.Pin = GPIO_PIN_13 | GPIO_PIN_14 | GPIO_PIN_15 | GPIO_PIN_1 | GPIO_PIN_2 | GPIO_PIN_3 | GPIO_PIN_4 | GPIO_PIN_5 | GPIO_PIN_6 | GPIO_PIN_7 | GPIO_PIN_8 | GPIO_PIN_9 | GPIO_PIN_10 | GPIO_PIN_11 | GPIO_PIN_12;
+  GPIO_InitStruct.Mode = GPIO_MODE_ANALOG;
+  HAL_GPIO_Init(GPIOC, &GPIO_InitStruct);
+
+  /*Configure GPIO pins : PA0 PA3 PA5 PA6
+                           PA7 PA8 PA15 */
+  GPIO_InitStruct.Pin = GPIO_PIN_0 | GPIO_PIN_3 | GPIO_PIN_5 | GPIO_PIN_6 | GPIO_PIN_7 | GPIO_PIN_8 | GPIO_PIN_15;
+  GPIO_InitStruct.Mode = GPIO_MODE_ANALOG;
+  HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
 
   /*Configure GPIO pin : latch_reset_Pin */
   GPIO_InitStruct.Pin = latch_reset_Pin;
@@ -564,6 +708,13 @@ static void MX_GPIO_Init(void)
   GPIO_InitStruct.Mode = GPIO_MODE_IT_RISING;
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   HAL_GPIO_Init(latch_output_GPIO_Port, &GPIO_InitStruct);
+
+  /*Configure GPIO pins : PB0 PB1 PB10 PB11
+                           PB12 PB13 PB14 PB3
+                           PB4 PB5 PB8 PB9 */
+  GPIO_InitStruct.Pin = GPIO_PIN_0 | GPIO_PIN_1 | GPIO_PIN_10 | GPIO_PIN_11 | GPIO_PIN_12 | GPIO_PIN_13 | GPIO_PIN_14 | GPIO_PIN_3 | GPIO_PIN_4 | GPIO_PIN_5 | GPIO_PIN_8 | GPIO_PIN_9;
+  GPIO_InitStruct.Mode = GPIO_MODE_ANALOG;
+  HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
 
   /*Configure GPIO pin : arm_pin_Pin */
   GPIO_InitStruct.Pin = arm_pin_Pin;
@@ -579,11 +730,16 @@ static void MX_GPIO_Init(void)
   HAL_GPIO_Init(fault_led_GPIO_Port, &GPIO_InitStruct);
 
   /*Configure GPIO pins : can_led_Pin can_mode_Pin */
-  GPIO_InitStruct.Pin = can_led_Pin|can_mode_Pin;
+  GPIO_InitStruct.Pin = can_led_Pin | can_mode_Pin;
   GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
   HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
+
+  /*Configure GPIO pin : PD2 */
+  GPIO_InitStruct.Pin = GPIO_PIN_2;
+  GPIO_InitStruct.Mode = GPIO_MODE_ANALOG;
+  HAL_GPIO_Init(GPIOD, &GPIO_InitStruct);
 
   /* USER CODE BEGIN MX_GPIO_Init_2 */
 
@@ -591,63 +747,108 @@ static void MX_GPIO_Init(void)
 }
 
 /* USER CODE BEGIN 4 */
+void try_can_move(CAN_HandleTypeDef *hcan_it)
+{
+  if (hcan_it == &hcan)
+  {
+    if (can_move_to_fifo() == 0 && lwrb_get_full(&can_tx_rb) == 0)
+    {
+      __HAL_TIM_SET_COUNTER(htim_can_disconnect, 0);
+      HAL_TIM_Base_Stop_IT(htim_can_disconnect);
+      HAL_GPIO_WritePin(can_led_GPIO_Port, can_led_Pin, GPIO_PIN_RESET);
+      HAL_GPIO_WritePin(can_mode_GPIO_Port, can_mode_Pin, GPIO_PIN_SET);
+    }
+  }
+}
+
+void HAL_CAN_TxMailbox0CompleteCallback(CAN_HandleTypeDef *hcan)
+{
+  try_can_move(hcan);
+}
+void HAL_CAN_TxMailbox1CompleteCallback(CAN_HandleTypeDef *hcan)
+{
+  try_can_move(hcan);
+}
+void HAL_CAN_TxMailbox2CompleteCallback(CAN_HandleTypeDef *hcan)
+{
+  try_can_move(hcan);
+}
+
 void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
 {
-    if (htim->Instance == TIM6)
-    {
-        //stop the timer so it doesn't repeat
-        HAL_TIM_Base_Stop_IT(&htim6);
-		HAL_GPIO_WritePin(GPIOB, GPIO_PIN_15, GPIO_PIN_SET); // turn off led
-    } else if (htim->Instance == TIM7)
-    {
-        //stop the timer so it doesn't repeat
-        HAL_TIM_Base_Stop_IT(&htim7);
-		HAL_GPIO_WritePin(GPIOA, GPIO_PIN_1, GPIO_PIN_RESET); // turn of reset pin
-    }
+  if (htim->Instance == TIM6)
+  {
+    //stop the timer so it doesn't repeat
+    HAL_TIM_Base_Stop_IT(&htim6);
+    HAL_GPIO_WritePin(GPIOB, GPIO_PIN_15, GPIO_PIN_SET); // turn off led
+  }
+  else if (htim->Instance == TIM7)
+  {
+    //stop the timer so it doesn't repeat
+    HAL_TIM_Base_Stop_IT(&htim7);
+    HAL_GPIO_WritePin(GPIOA, GPIO_PIN_1, GPIO_PIN_RESET); // turn of reset pin
+  }
+  else if (htim == htim_can_disconnect && initialized)
+  {
+    // sfx_twotone(5, 50, 10);
+    HAL_TIM_Base_Stop_IT(htim_can_disconnect);
+
+    // empty stale
+    HAL_CAN_AbortTxRequest(&hcan, CAN_TX_MAILBOX0 | CAN_TX_MAILBOX1 | CAN_TX_MAILBOX2);
+    lwrb_reset(&can_tx_rb);
+
+    // enter shutdown and standby
+    HAL_GPIO_WritePin(can_led_GPIO_Port, can_led_Pin, GPIO_PIN_RESET);
+    HAL_GPIO_WritePin(can_mode_GPIO_Port, can_mode_Pin, GPIO_PIN_SET);
+  }
 }
 
 void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
 {
-    if (GPIO_Pin == GPIO_PIN_2 && system_tripped == false) //if the latch gets tripped
-    {
-        system_tripped = true;
-    }
-
+  if (GPIO_Pin == GPIO_PIN_2 && system_tripped == false) //if the latch gets tripped
+  {
+    system_tripped = true;
+  }
 }
 
-void Reset_Latch(void){
-	//generate a 100ms pulse on the reset pin
-	HAL_GPIO_WritePin(GPIOA, GPIO_PIN_1, GPIO_PIN_SET);
+void Reset_Latch(void)
+{
+  //generate a 100ms pulse on the reset pin
+  HAL_GPIO_WritePin(GPIOA, GPIO_PIN_1, GPIO_PIN_SET);
 
-	  HAL_TIM_Base_Stop_IT(&htim7);
-	  __HAL_TIM_SET_AUTORELOAD(&htim7, 100 - 1); // configure timer 6 to trigger interrupt in 100 ms
-	  __HAL_TIM_SET_COUNTER(&htim7, 0);
-	  __HAL_TIM_CLEAR_FLAG(&htim7, TIM_FLAG_UPDATE);
-	  HAL_TIM_Base_Start_IT(&htim7); // start timer
+  HAL_TIM_Base_Stop_IT(&htim7);
+  __HAL_TIM_SET_AUTORELOAD(&htim7, 100 - 1); // configure timer 6 to trigger interrupt in 100 ms
+  __HAL_TIM_SET_COUNTER(&htim7, 0);
+  __HAL_TIM_CLEAR_FLAG(&htim7, TIM_FLAG_UPDATE);
+  HAL_TIM_Base_Start_IT(&htim7); // start timer
 }
 
-void Set_Dac(uint32_t val){
-	HAL_DAC_SetValue(&hdac, DAC_CHANNEL_1, DAC_ALIGN_12B_R, val);
+void Set_Dac(uint32_t val)
+{
+  HAL_DAC_SetValue(&hdac, DAC_CHANNEL_1, DAC_ALIGN_12B_R, val);
 }
 
-void Generate_Telemetry(void){
-    // 1. Current Sense (ADC PC0)
-    HAL_ADC_Start(&hadc1);
-    if (HAL_ADC_PollForConversion(&hadc1, 10) == HAL_OK) {
-        uint32_t raw = HAL_ADC_GetValue(&hadc1);
-        float voltage = (raw * 3.3f) / 4095.0f;
-        // Sensitivity: 16.5mV/A, Offset: 1.65V
-        Curr_val = (voltage - 1.65f) / 0.0165f;
-    }
-    HAL_ADC_Stop(&hadc1);
+void Generate_Telemetry(void)
+{
+  // 1. Current Sense (ADC PC0)
+  HAL_ADC_Start(&hadc1);
+  if (HAL_ADC_PollForConversion(&hadc1, 10) == HAL_OK)
+  {
+    uint32_t raw = HAL_ADC_GetValue(&hadc1);
+    float voltage = (raw * 3.3f) / 4095.0f;
+    // Sensitivity: 16.5mV/A, Offset: 1.65V
+    Curr_val = (voltage - 1.65f) / 0.0165f;
+  }
+  HAL_ADC_Stop(&hadc1);
 
-    // 2. Temperature Sense (I2C TMP112)
-    uint8_t i2c_buf[2];
-    // Address 0x48 (7-bit) shifted for HAL
-    if (HAL_I2C_Master_Receive(&hi2c1, (0x48 << 1), i2c_buf, 2, 50) == HAL_OK) {
-        int16_t raw_temp = (i2c_buf[0] << 4) | (i2c_buf[1] >> 4);
-        Temp_val = raw_temp * 0.0625f;
-    }
+  // 2. Temperature Sense (I2C TMP112)
+  uint8_t i2c_buf[2];
+  // Address 0x48 (7-bit) shifted for HAL
+  if (HAL_I2C_Master_Receive(&hi2c1, (0x48 << 1), i2c_buf, 2, 50) == HAL_OK)
+  {
+    int16_t raw_temp = (i2c_buf[0] << 4) | (i2c_buf[1] >> 4);
+    Temp_val = raw_temp * 0.0625f;
+  }
 }
 
 #if 0
@@ -686,8 +887,8 @@ void Generate_Telemetry(void){
 	adc_value = HAL_ADC_GetValue(&hadc1);           // Read result (0-4095)
 	HAL_ADC_Stop(&hadc1);
 
-	#define VREF 3.3f
-	#define ADC_TO_VOLTAGE(raw)  ((float)(raw) / 4095.0f * VREF)
+#define VREF 3.3f
+#define ADC_TO_VOLTAGE(raw) ((float)(raw) / 4095.0f * VREF)
 
 	uint32_t raw = HAL_ADC_GetValue(&hadc1);
 	float voltage = ADC_TO_VOLTAGE(raw);
@@ -704,6 +905,7 @@ void Error_Handler(void)
 {
   /* USER CODE BEGIN Error_Handler_Debug */
   /* User can add his own implementation to report the HAL error return state */
+  __BKPT();
   __disable_irq();
   while (1)
   {

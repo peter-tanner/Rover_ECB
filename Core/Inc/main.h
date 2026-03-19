@@ -31,7 +31,9 @@ extern "C" {
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
+#include "lwrb.h"
 #include <stdbool.h>
+
 /* USER CODE END Includes */
 
 /* Exported types ------------------------------------------------------------*/
@@ -57,6 +59,11 @@ void Error_Handler(void);
 /* USER CODE END EFP */
 
 /* Private defines -----------------------------------------------------------*/
+#define CAN_TIMEOUT_PSC_DIV (HCLK_kHz - 1)
+#define CAN_TIMEOUT_ms 50
+#define HCLK_Hz (HCLK_MHz * 1000000)
+#define HCLK_MHz 8
+#define HCLK_kHz (HCLK_MHz * 1000)
 #define Ia_val_Pin GPIO_PIN_0
 #define Ia_val_GPIO_Port GPIOC
 #define latch_reset_Pin GPIO_PIN_1
